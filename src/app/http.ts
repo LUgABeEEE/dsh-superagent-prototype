@@ -72,13 +72,30 @@ async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<un
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); res.end(JSON.stringify(value))
 }
+/**
+ * Whether a management request comes from this deployment's own panel.
+ *
+ * The panel is same-origin, so its requests carry the authority the person opened — which is not
+ * always loopback: an installation reached over a LAN address, a machine name or a tunnel has a
+ * Host this code cannot enumerate. What actually keeps other pages out is the marker header: a
+ * cross-site request cannot set `x-orchestrator-request` without a preflight this server never
+ * answers. The authority is still bound: the port must be ours, and when the browser sends an
+ * `Origin` it must be the same authority.
+ */
 export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, allowedHosts: readonly string[] = []): boolean {
   const host = req.headers.host
+  if (req.headers['x-orchestrator-request'] !== '1') return false
+  if (host === undefined || host === '') return false
+  if (req.headers.origin !== undefined && req.headers.origin !== `http://${host}`) return false
   const loopback = host === `127.0.0.1:${port}` || host === `localhost:${port}`
-  // A named deployment is the same deployment: the panel is served from that authority, so its own
-  // requests carry it. Anything not named here is someone else's page.
-  if (!loopback && !(host !== undefined && allowedHosts.some(allowed => allowed.toLowerCase() === host.toLowerCase()))) return false
-  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
+  const named = allowedHosts.some(allowed => allowed.toLowerCase() === host.toLowerCase() || allowed === '*')
+  const authority = host.slice(0, host.lastIndexOf(':'))
+  // An address this deployment answers on is one no other page can borrow: a DNS name that resolves
+  // here is exactly what a rebinding attack needs, so names are named and IP literals are trusted.
+  const literal = /^(\d{1,3}\.){3}\d{1,3}$/.test(authority) || authority.startsWith('[')
+  // Ours is the port the panel is served on; a page on another port is another deployment.
+  const samePort = host.slice(host.lastIndexOf(':') + 1) === String(port)
+  return loopback || named || (literal && samePort)
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
