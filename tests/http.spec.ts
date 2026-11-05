@@ -76,6 +76,16 @@ it('answers only a same-origin request from the panel on the loopback address', 
       body: { error: 'Same-origin management request required' } })
   }
   expect(await post({ host: 'localhost:3082', origin: 'http://localhost:3082' })).toMatchObject({ status: 200 })
+  // A deployment opened over a LAN address is still this deployment: the panel is served from that
+  // authority, so its requests carry it. Only the authorities the configuration names are accepted.
+  const named = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true },
+    machine: { allowedHosts: ['192.168.1.11:3082'] } } as never)
+  expect(await named('POST', 'threads/github%3A1/unsubscribe', undefined, { host: '192.168.1.11:3082' }))
+    .toMatchObject({ status: 200 })
+  expect(await named('POST', 'threads/github%3A1/unsubscribe', undefined,
+    { host: '192.168.1.11:3082', origin: 'http://192.168.1.11:3082' })).toMatchObject({ status: 200 })
+  expect(await named('POST', 'threads/github%3A1/unsubscribe', undefined, { host: 'evil.example:3082' }))
+    .toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
   // Management routes require a loopback Web server.
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
 })

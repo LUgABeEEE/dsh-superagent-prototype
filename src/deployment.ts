@@ -24,11 +24,16 @@ export const Config = s.object({
   // account to verify. Off by default: a GitHub installation must still name its repository.
   githubOptional: s.boolean().default(false)
     .description('Allow startup without a GitHub Source, for an installation that only uses another Source.'),
+  // The panel is same-origin: its requests carry the address the person opened. A deployment reached
+  // over a LAN address or a tunnel name has a Host the loopback check cannot know, so it is named here.
+  allowedHosts: s.array(s.string().min(1)).default([])
+    .description('Extra Host authorities (host:port) the management API accepts besides 127.0.0.1 and localhost.'),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export interface Machine {
   stateDir: string
   githubOptional: boolean
+  allowedHosts: string[]
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
@@ -43,8 +48,8 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, githubOptional } = config
-  return { stateDir, githubOptional, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, githubOptional, allowedHosts } = config
+  return { stateDir, githubOptional, allowedHosts, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
 }
 
 export const GithubAccountsSchema = z.object({
