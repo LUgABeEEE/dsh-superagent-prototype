@@ -87,7 +87,11 @@ export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, 
   if (req.headers['x-orchestrator-request'] !== '1') return false
   if (host === undefined || host === '') return false
   if (req.headers.origin !== undefined && req.headers.origin !== `http://${host}`) return false
-  const loopback = host === `127.0.0.1:${port}` || host === `localhost:${port}`
+  // A loopback authority is this machine, whatever port a forwarder put in front of it: an SSH
+  // tunnel (`-L 3380:127.0.0.1:3080`) hands the browser `127.0.0.1:3380`, and the panel then calls
+  // this API on that same authority. Nothing else can claim a loopback authority.
+  const authority0 = host.slice(0, host.lastIndexOf(':'))
+  const loopback = authority0 === '127.0.0.1' || authority0 === 'localhost' || authority0 === '[::1]'
   const named = allowedHosts.some(allowed => allowed.toLowerCase() === host.toLowerCase() || allowed === '*')
   const authority = host.slice(0, host.lastIndexOf(':'))
   // An address this deployment answers on is one no other page can borrow: a DNS name that resolves

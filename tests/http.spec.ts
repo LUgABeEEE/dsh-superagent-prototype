@@ -70,7 +70,7 @@ it('decodes path parameters and parses each route\'s query', async () => {
 it('answers only a same-origin request from the panel on the loopback address', async () => {
   const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } })
   const post = (headers: Headers) => call('POST', 'threads/github%3A1/unsubscribe', undefined, headers)
-  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:8080' }, { host: '127.0.0.1:9999' },
+  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:8080' }, { host: '127.0.0.1' },
     { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' },
     { host: '192.168.1.11:3082', origin: 'http://elsewhere.example' }, { host: '192.168.1.11:3081' }]) {
     expect(await post(headers), JSON.stringify(headers)).toEqual({ status: 403,
@@ -85,6 +85,10 @@ it('answers only a same-origin request from the panel on the loopback address', 
   expect(await post({ host: 'SER:3082', origin: 'http://SER:3082' })).toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
   expect(await post({ host: '10.88.0.2:3082' })).toMatchObject({ status: 200 })
   expect(await post({ host: '192.168.1.11:3082', origin: 'http://192.168.1.11:3082' })).toMatchObject({ status: 200 })
+  // A tunnel in front of the deployment changes the port the browser sees, not who is answering:
+  // an SSH `-L 3380:127.0.0.1:3082` hands the page 127.0.0.1:3380 and the panel calls this API there.
+  expect(await post({ host: '127.0.0.1:3380', origin: 'http://127.0.0.1:3380' })).toMatchObject({ status: 200 })
+  expect(await post({ host: 'localhost:3380' })).toMatchObject({ status: 200 })
   // A deployment opened over a LAN address is still this deployment: the panel is served from that
   // authority, so its requests carry it. Only the authorities the configuration names are accepted.
   const named = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true },
