@@ -47,7 +47,8 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
     GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
     // A worker's git finds the repository from its directory, never from the host's environment.
     ...Object.fromEntries(GIT_LOCATION.map(name => [name, undefined])),
-    GIT_CONFIG_GLOBAL: workerGitConfig(stateDir), GIT_CONFIG_NOSYSTEM: '1',
+    // Not applied globally: a `git` shim sets these for a worker Session only (see writeEnvironment).
+    GIT_CONFIG_GLOBAL: undefined, GIT_CONFIG_NOSYSTEM: undefined,
     // Clear environment git config overrides; configuration passed through the environment would otherwise reach every git command the agent runs.
     GIT_CONFIG_COUNT: undefined, GIT_CONFIG_PARAMETERS: undefined,
     // When the credential helper has no answer, git must fail rather than prompt; `GIT_ASKPASS: ''` also overrides `core.askPass` and `SSH_ASKPASS`.
@@ -76,7 +77,7 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
  * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving `gh` or `lark-cli` by name reach the real binary.
  */
-export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
+export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[], path = process.env.PATH ?? ''): Promise<void> {
   const { stateDir, repository, github, feishu } = deployment
   const dir = workerBin(stateDir)
   await mkdir(dir, { recursive: true })
@@ -95,12 +96,73 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
-  const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  // The shim directory is on the PATH of the whole Host process, so these names are also what an
+  // operator's own shell resolves. A worker Session gets the deployment's CLI; anything else must
+  // reach the real binary, or every `gh` in the panel would silently act as the agent account.
+  const run = (program: string, name: string): string => [
+    'case "${DSH_SESSION_ID:-}" in',
+    '  worker-*)',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `    exec ${shellQuote(program)} "$@"`,
+    '    ;;',
+    'esac',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `exec ${shellQuote(name)} "$@"`,
+  ].join('\n')
+  // A CLI this deployment does not configure must fail for a worker, but an operator's own shell still
+  // has to reach whatever binary it normally would: a shim that only ever exits is a broken `lark-cli`
+  // for everyone else.
+  const fail = (message: string, name: string): string => [
+    'case "${DSH_SESSION_ID:-}" in',
+    '  worker-*)',
+    `    echo ${shellQuote(message)} >&2`,
+    '    exit 1',
+    '    ;;',
+    'esac',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `exec ${shellQuote(name)} "$@"`,
+  ].join('\n')
+  await shim('gh', github.cli === '' ? fail('gh is unavailable: this installation has no GitHub account.', 'gh') : run(github.cli, 'gh'))
+  await shim('lark-cli', feishu ? run(feishu.cli, 'lark-cli') : fail('lark-cli is unavailable: this installation has no Feishu bot.', 'lark-cli'))
+  // Workers must see only the deployment's git configuration; the operator's own shells must not, or
+  // every commit in the panel would be authored (and pushed) as the agent account. A shim can scope
+  // that to the worker Session, which a process-wide variable cannot.
+  await shim('git', [
+    'case "${DSH_SESSION_ID:-}" in',
+    '  worker-*)',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `    GIT_CONFIG_GLOBAL=${shellQuote(workerGitConfig(stateDir))}`,
+    '    GIT_CONFIG_NOSYSTEM=1',
+    '    GIT_CONFIG_COUNT=',
+    '    GIT_CONFIG_PARAMETERS=',
+    '    GIT_ASKPASS=',
+    '    GIT_TERMINAL_PROMPT=0',
+    '    unset GIT_AUTHOR_NAME GIT_COMMITTER_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL SSH_ASKPASS',
+    '    export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_ASKPASS GIT_TERMINAL_PROMPT',
+    '    ;;',
+    'esac',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    'exec git "$@"',
+  ].join('\n'))
+  // The shim directory is on the PATH of the whole Host process, not just Executor Sessions, so a
+  // blocked name must stay usable everywhere else: it refuses only inside a worker Session
+  // (`DSH_SESSION_ID` set to `worker-…`) and otherwise runs the real binary. Without that, an
+  // operator working in the panel would find `systemctl` or `docker` "blocked" in their own shell.
+  const real = (name: string): string | undefined => {
+    for (const entry of withoutDirectory(path, dir).split(delimiter)) {
+      if (entry === '') continue
+      try { return realpathSync(join(entry, name)) } catch { continue }
+    }
+    return undefined
+  }
+  const blockInWorker = (name: string): string => {
+    const target = real(name)
+    const refusal = `echo ${shellQuote(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`)} >&2\nexit 1`
+    if (target === undefined) return refusal
+    return `case "\${DSH_SESSION_ID:-}" in\n  worker-*) ${refusal.replaceAll('\n', '; ')} ;;\nesac\nexec ${shellQuote(target)} "$@"`
+  }
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+    await shim(name, blockInWorker(name))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [
@@ -115,9 +177,16 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n') + '\n')
 }
 
-/** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */
-export function applyEnvironment(variables: Record<string, string | undefined>, stateDir: string, path: string): () => void {
-  const values = { ...variables, PATH: [workerBin(stateDir), path].join(delimiter) }
+/**
+ * Prepends worker shims to `process.env.PATH`, returning a restore callback.
+ *
+ * Only PATH reaches the Host process: DSH has no way to give one Session its own environment, so the shim directory
+ * must be on the shared PATH for a worker to find it. Every other agent variable is passed explicitly to the
+ * subprocess the plugin itself runs (`commands`), so the operator's shells keep their own GH_TOKEN, git
+ * configuration and commit identity instead of silently inheriting the agent's.
+ */
+export function applyEnvironment(stateDir: string, path: string): () => void {
+  const values = { PATH: [workerBin(stateDir), path].join(delimiter) }
   const previous = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]))
   const apply = (env: Record<string, string | undefined>): void => { for (const [name, value] of Object.entries(env)) { if (value === undefined) delete process.env[name]; else process.env[name] = value } }
   apply(values)
@@ -125,7 +194,7 @@ export function applyEnvironment(variables: Record<string, string | undefined>, 
 }
 
 /** Spawns a command through the DSH subprocess runtime, which strips credential-shaped environment variables. */
-export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string>): Promise<string> {
+export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string | undefined>): Promise<string> {
   const handle = subprocess.spawn({ argv, cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
   const { exitCode } = await handle.done
   const read = (reader: SubprocessOutputReader | undefined): string => reader?.readFrom(0).text ?? ''
@@ -134,11 +203,29 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
   throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
 }
 
+/**
+ * The git environment a worker Session gets from the `git` shim, for Host-side commands that must
+ * verify the worker's view (setup probes) without being a worker Session themselves.
+ */
+export function workerGitEnvironment(stateDir: string, base: Record<string, string | undefined> = {}): Record<string, string | undefined> {
+  return {
+    ...base,
+    GIT_CONFIG_GLOBAL: workerGitConfig(stateDir),
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_COUNT: '',
+    GIT_CONFIG_PARAMETERS: '',
+    GIT_ASKPASS: '',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_AUTHOR_NAME: undefined, GIT_COMMITTER_NAME: undefined,
+    GIT_AUTHOR_EMAIL: undefined, GIT_COMMITTER_EMAIL: undefined, SSH_ASKPASS: undefined,
+  }
+}
+
 /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
-export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal, env?: Record<string, string | undefined>): Promise<void> {
   const { github, stateDir } = deployment
   // `-z` separates fields with NUL and never quotes paths.
-  const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
+  const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), env).catch(() => '')).split('\0')
   if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
 }
 
@@ -146,10 +233,10 @@ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 
  * Verifies that a ticket directory's local or worktree git config defines no custom `credential.*` or `http.*extraheader`
  * keys, which the agent's git would read from the repository's own config and act on.
  */
-export async function verifyDirectory(directory: string, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+export async function verifyDirectory(directory: string, subprocess: SubprocessRuntime, signal: AbortSignal, env?: Record<string, string | undefined>): Promise<void> {
   const keys = ['git', 'config', '-z', '--show-scope', '--get-regexp', '^(credential\\..*|http\\..*extraheader)$']
   // `git config --get-regexp` exits with code 1 when no keys match.
-  const output = await runAsWorker(subprocess, keys, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  const output = await runAsWorker(subprocess, keys, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), env)
     .catch((error: unknown) => { if (error instanceof CliError && error.exitCode === 1) return ''; throw error })
   const scoped = output.split('\0')
   const local = scoped.flatMap((scope, index) => index % 2 === 0 && (scope === 'local' || scope === 'worktree') ? [scoped[index + 1]!.split('\n')[0]!] : [])

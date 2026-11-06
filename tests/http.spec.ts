@@ -70,12 +70,54 @@ it('decodes path parameters and parses each route\'s query', async () => {
 it('answers only a same-origin request from the panel on the loopback address', async () => {
   const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } })
   const post = (headers: Headers) => call('POST', 'threads/github%3A1/unsubscribe', undefined, headers)
-  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { host: '127.0.0.1:9999' },
-    { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' }]) {
-    expect(await post(headers), JSON.stringify(headers)).toEqual({ status: 403,
-      body: { error: 'Same-origin management request required' } })
+  // An unmarked request still needs a host it is allowed to be: naming nobody is refused outright.
+  for (const headers of [{ 'x-orchestrator-request': undefined, host: undefined },
+    { host: 'evil.example:8080', 'x-orchestrator-request': undefined }, { host: 'evil.example:8080' }, { host: '127.0.0.1' },
+    { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' },
+    { host: '192.168.1.11:3082', origin: 'http://elsewhere.example' }, { host: 'evil.example:3082' }]) {
+    expect(await post(headers), JSON.stringify(headers)).toMatchObject({ status: 403,
+      body: { error: expect.stringContaining('Same-origin management request required') } })
   }
   expect(await post({ host: 'localhost:3082', origin: 'http://localhost:3082' })).toMatchObject({ status: 200 })
+  // An address this code cannot enumerate is still ours when it is on our port and the browser's
+  // Origin agrees: that is what a LAN address, a machine name or a tunnel looks like.
+  expect(await post({ host: '192.168.1.11:3082' })).toMatchObject({ status: 200 })
+  // A machine name is not an address we can vouch for (a rebinding attack needs exactly that), so a
+  // name has to be named — but the deployment's own address is enough on its own.
+  expect(await post({ host: 'SER:3082', origin: 'http://SER:3082' })).toMatchObject({ status: 403, body: { error: expect.stringContaining('Same-origin management request required') } })
+  expect(await post({ host: '10.88.0.2:3082' })).toMatchObject({ status: 200 })
+  // The DSH mobile gateway answers over TLS, so the page's Origin is https while this listener is http.
+  expect(await post({ host: '192.168.1.11:3443', origin: 'https://192.168.1.11:3443' })).toMatchObject({ status: 200 })
+  // A page on another authority is still refused, whatever the scheme.
+  expect(await post({ host: '192.168.1.11:3443', origin: 'https://evil.example:3443' }))
+    .toMatchObject({ status: 403, body: { error: expect.stringContaining('Same-origin management request required') } })
+  // DSH 手机网关在 3443 上应答并转发到这里，浏览器的 Host 带的是网关端口。
+  expect(await post({ host: '192.168.1.11:3443' })).toMatchObject({ status: 200 })
+  expect(await post({ host: '192.168.1.11:3082', origin: 'http://192.168.1.11:3082' })).toMatchObject({ status: 200 })
+  // A tunnel in front of the deployment changes the port the browser sees, not who is answering:
+  // an SSH `-L 3380:127.0.0.1:3082` hands the page 127.0.0.1:3380 and the panel calls this API there.
+  expect(await post({ host: '127.0.0.1:3380', origin: 'http://127.0.0.1:3380' })).toMatchObject({ status: 200 })
+  expect(await post({ host: 'localhost:3380' })).toMatchObject({ status: 200 })
+  // A deployment opened over a LAN address is still this deployment: the panel is served from that
+  // authority, so its requests carry it. Only the authorities the configuration names are accepted.
+  const named = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true },
+    machine: { allowedHosts: ['192.168.1.11:3082'] } } as never)
+  expect(await named('POST', 'threads/github%3A1/unsubscribe', undefined, { host: '192.168.1.11:3082' }))
+    .toMatchObject({ status: 200 })
+  expect(await named('POST', 'threads/github%3A1/unsubscribe', undefined,
+    { host: '192.168.1.11:3082', origin: 'http://192.168.1.11:3082' })).toMatchObject({ status: 200 })
+  expect(await named('POST', 'threads/github%3A1/unsubscribe', undefined, { host: 'evil.example:3082' }))
+    .toMatchObject({ status: 403, body: { error: expect.stringContaining('Same-origin management request required') } })
+  // The DSH mobile gateway forwards with `Host: 127.0.0.1:3080` and keeps neither the page's Origin
+  // nor the panel's marker. Loopback trust carries that case; a name or address alone does not.
+  expect(await post({ host: '127.0.0.1:3080', 'x-orchestrator-request': undefined })).toMatchObject({ status: 200 })
+  expect(await post({ host: 'localhost:3080', 'x-orchestrator-request': undefined })).toMatchObject({ status: 200 })
+  expect(await post({ host: '192.168.1.11:3080', 'x-orchestrator-request': undefined }))
+    .toMatchObject({ status: 403, body: { error: expect.stringContaining('Same-origin management request required') } })
+  // A cross-site page reaches loopback too, but it always sends Origin and cannot pass a preflight.
+  expect(await post({ host: '127.0.0.1:3080', 'x-orchestrator-request': undefined, origin: 'http://evil.example' }))
+    .toMatchObject({ status: 403, body: { error: expect.stringContaining('Same-origin management request required') } })
+
   // Management routes require a loopback Web server.
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
 })

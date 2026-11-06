@@ -1,7 +1,9 @@
 /** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import { appendFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { join } from 'node:path'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
@@ -72,10 +74,46 @@ async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<un
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); res.end(JSON.stringify(value))
 }
-export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number): boolean {
+/**
+ * Whether a management request comes from this deployment's own panel.
+ *
+ * The panel is same-origin, so its requests carry the authority the person opened — which is not
+ * always loopback: an installation reached over a LAN address, a machine name or a tunnel has a
+ * Host this code cannot enumerate. What actually keeps other pages out is the marker header: a
+ * cross-site request cannot set `x-orchestrator-request` without a preflight this server never
+ * answers. The authority is still bound: the port must be ours, and when the browser sends an
+ * `Origin` it must be the same authority.
+ */
+export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, allowedHosts: readonly string[] = []): boolean {
   const host = req.headers.host
-  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return false
-  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
+  if (host === undefined || host === '') return false
+  const authority = host.slice(0, host.lastIndexOf(':'))
+  // A loopback authority is this machine, whatever port a forwarder put in front of it: an SSH
+  // tunnel (`-L 3380:127.0.0.1:3080`) hands the browser `127.0.0.1:3380`, and the panel then calls
+  // this API on that same authority. Nothing else can claim a loopback authority.
+  const loopback = authority === '127.0.0.1' || authority === 'localhost' || authority === '[::1]'
+  const named = allowedHosts.some(allowed => allowed.toLowerCase() === host.toLowerCase() || allowed === '*')
+  // An address this deployment answers on is one no other page can borrow: a DNS name that resolves
+  // here is exactly what a rebinding attack needs, so names are named and IP literals are trusted.
+  const literal = /^(\d{1,3}\.){3}\d{1,3}$/.test(authority) || authority.startsWith('[')
+  if (!(loopback || named || literal)) return false
+  const marked = req.headers['x-orchestrator-request'] === '1'
+  const origin = req.headers.origin
+  if (origin === undefined) {
+    // No Origin at all: a same-origin fetch, a non-browser client, or a gateway in front of this
+    // server. The DSH mobile gateway answers over TLS and proxies here with `Host: 127.0.0.1:3080`,
+    // keeping neither Origin nor the panel's marker, so loopback trust carries that case. Everywhere
+    // else the marker is still required, because a name or address alone proves nothing.
+    return loopback || marked
+  }
+  // A browser sent Origin, so the page was somewhere: it must be this same authority (scheme aside —
+  // the gateway terminates TLS and this listener only ever sees http), and it must have passed the
+  // preflight that a custom header forces. A cross-site page can do neither without this server
+  // answering CORS, which it never does.
+  let originHost: string
+  try { originHost = new URL(origin).host } catch { return false }
+  if (originHost.toLowerCase() !== host.toLowerCase()) return false
+  return marked
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
@@ -234,7 +272,23 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      if (!sameOrigin(req, ctx.webServer.port, runtime.machine?.allowedHosts ?? [])) {
+        // Say which authority was refused: a panel that cannot reach the API is otherwise a
+        // dead end for whoever is looking at it. Record it too — a browser cannot be asked which
+        // headers it sent, and this rejection is invisible from the operator's own machine.
+        const detail = { at: new Date().toISOString(), method: req.method, url: url.pathname,
+          host: req.headers.host ?? '', origin: req.headers.origin ?? '',
+          marked: req.headers['x-orchestrator-request'] === '1',
+          referer: req.headers.referer ?? '', agent: (req.headers['user-agent'] ?? '').slice(0, 160) }
+        try {
+          appendFileSync(join(runtime.machine.stateDir, 'same-origin-rejects.jsonl'), JSON.stringify(detail) + '\n')
+        } catch { /* Logging must never turn a refusal into a failure of its own. */ }
+        // The reason travels in the message itself: a remote page cannot show the server log, and
+        // the operator reading it is the only one who can see which authority their browser sent.
+        json(res, 403, { error: `Same-origin management request required (host=${detail.host || '∅'}, origin=${detail.origin || '∅'}, marked=${detail.marked ? 'yes' : 'no'})`,
+          host: detail.host, reason: detail })
+        return
+      }
       try {
         await runtime.ready
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
