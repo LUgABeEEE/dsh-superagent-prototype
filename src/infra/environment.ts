@@ -76,7 +76,7 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
  * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving `gh` or `lark-cli` by name reach the real binary.
  */
-export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
+export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[], path = process.env.PATH ?? ''): Promise<void> {
   const { stateDir, repository, github, feishu } = deployment
   const dir = workerBin(stateDir)
   await mkdir(dir, { recursive: true })
@@ -95,12 +95,41 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  // The shim directory is on the PATH of the whole Host process, so these names are also what an
+  // operator's own shell resolves. A worker Session gets the deployment's CLI; anything else must
+  // reach the real binary, or every `gh` in the panel would silently act as the agent account.
+  const run = (program: string, name: string): string => [
+    'case "${DSH_SESSION_ID:-}" in',
+    '  worker-*)',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `    exec ${shellQuote(program)} "$@"`,
+    '    ;;',
+    'esac',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `exec ${shellQuote(name)} "$@"`,
+  ].join('\n')
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', github.cli === '' ? fail('gh is unavailable: this installation has no GitHub account.') : run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  await shim('gh', github.cli === '' ? fail('gh is unavailable: this installation has no GitHub account.') : run(github.cli, 'gh'))
+  await shim('lark-cli', feishu ? run(feishu.cli, 'lark-cli') : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  // The shim directory is on the PATH of the whole Host process, not just Executor Sessions, so a
+  // blocked name must stay usable everywhere else: it refuses only inside a worker Session
+  // (`DSH_SESSION_ID` set to `worker-…`) and otherwise runs the real binary. Without that, an
+  // operator working in the panel would find `systemctl` or `docker` "blocked" in their own shell.
+  const real = (name: string): string | undefined => {
+    for (const entry of withoutDirectory(path, dir).split(delimiter)) {
+      if (entry === '') continue
+      try { return realpathSync(join(entry, name)) } catch { continue }
+    }
+    return undefined
+  }
+  const blockInWorker = (name: string): string => {
+    const target = real(name)
+    const refusal = `echo ${shellQuote(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`)} >&2\nexit 1`
+    if (target === undefined) return refusal
+    return `case "\${DSH_SESSION_ID:-}" in\n  worker-*) ${refusal.replaceAll('\n', '; ')} ;;\nesac\nexec ${shellQuote(target)} "$@"`
+  }
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+    await shim(name, blockInWorker(name))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [
