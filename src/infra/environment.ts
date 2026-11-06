@@ -203,6 +203,24 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
   throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
 }
 
+/**
+ * The git environment a worker Session gets from the `git` shim, for Host-side commands that must
+ * verify the worker's view (setup probes) without being a worker Session themselves.
+ */
+export function workerGitEnvironment(stateDir: string, base: Record<string, string | undefined> = {}): Record<string, string | undefined> {
+  return {
+    ...base,
+    GIT_CONFIG_GLOBAL: workerGitConfig(stateDir),
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_COUNT: '',
+    GIT_CONFIG_PARAMETERS: '',
+    GIT_ASKPASS: '',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_AUTHOR_NAME: undefined, GIT_COMMITTER_NAME: undefined,
+    GIT_AUTHOR_EMAIL: undefined, GIT_COMMITTER_EMAIL: undefined, SSH_ASKPASS: undefined,
+  }
+}
+
 /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
 export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal, env?: Record<string, string | undefined>): Promise<void> {
   const { github, stateDir } = deployment

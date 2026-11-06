@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
-import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
+import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, workerGitEnvironment, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 
@@ -90,7 +90,7 @@ export class Setup {
     }
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
     this.restoreEnvironment = applyEnvironment(machine.stateDir, this.path)
-    await verifyEnvironment(resolved, context.subprocess, lifetime, this.commandEnvironment).catch((error: unknown) => {
+    await verifyEnvironment(resolved, context.subprocess, lifetime, workerGitEnvironment(machine.stateDir, this.commandEnvironment)).catch((error: unknown) => {
       this.restore()
       machineProblem(error)
     })
