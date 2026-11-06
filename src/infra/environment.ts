@@ -47,7 +47,8 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
     GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
     // A worker's git finds the repository from its directory, never from the host's environment.
     ...Object.fromEntries(GIT_LOCATION.map(name => [name, undefined])),
-    GIT_CONFIG_GLOBAL: workerGitConfig(stateDir), GIT_CONFIG_NOSYSTEM: '1',
+    // Not applied globally: a `git` shim sets these for a worker Session only (see writeEnvironment).
+    GIT_CONFIG_GLOBAL: undefined, GIT_CONFIG_NOSYSTEM: undefined,
     // Clear environment git config overrides; configuration passed through the environment would otherwise reach every git command the agent runs.
     GIT_CONFIG_COUNT: undefined, GIT_CONFIG_PARAMETERS: undefined,
     // When the credential helper has no answer, git must fail rather than prompt; `GIT_ASKPASS: ''` also overrides `core.askPass` and `SSH_ASKPASS`.
@@ -111,6 +112,21 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', github.cli === '' ? fail('gh is unavailable: this installation has no GitHub account.') : run(github.cli, 'gh'))
   await shim('lark-cli', feishu ? run(feishu.cli, 'lark-cli') : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  // Workers must see only the deployment's git configuration; the operator's own shells must not, or
+  // every commit in the panel would be authored (and pushed) as the agent account. A shim can scope
+  // that to the worker Session, which a process-wide variable cannot.
+  await shim('git', [
+    'case "${DSH_SESSION_ID:-}" in',
+    '  worker-*)',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `    GIT_CONFIG_GLOBAL=${shellQuote(workerGitConfig(stateDir))}`,
+    '    GIT_CONFIG_NOSYSTEM=1',
+    '    export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM',
+    '    ;;',
+    'esac',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    'exec git "$@"',
+  ].join('\n'))
   // The shim directory is on the PATH of the whole Host process, not just Executor Sessions, so a
   // blocked name must stay usable everywhere else: it refuses only inside a worker Session
   // (`DSH_SESSION_ID` set to `worker-…`) and otherwise runs the real binary. Without that, an
