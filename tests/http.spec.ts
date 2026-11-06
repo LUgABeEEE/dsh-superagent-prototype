@@ -84,6 +84,11 @@ it('answers only a same-origin request from the panel on the loopback address', 
   // name has to be named — but the deployment's own address is enough on its own.
   expect(await post({ host: 'SER:3082', origin: 'http://SER:3082' })).toMatchObject({ status: 403, body: { error: 'Same-origin management request required' } })
   expect(await post({ host: '10.88.0.2:3082' })).toMatchObject({ status: 200 })
+  // The DSH mobile gateway answers over TLS, so the page's Origin is https while this listener is http.
+  expect(await post({ host: '192.168.1.11:3443', origin: 'https://192.168.1.11:3443' })).toMatchObject({ status: 200 })
+  // A page on another authority is still refused, whatever the scheme.
+  expect(await post({ host: '192.168.1.11:3443', origin: 'https://evil.example:3443' }))
+    .toMatchObject({ status: 403, body: { error: 'Same-origin management request required' } })
   // DSH 手机网关在 3443 上应答并转发到这里，浏览器的 Host 带的是网关端口。
   expect(await post({ host: '192.168.1.11:3443' })).toMatchObject({ status: 200 })
   expect(await post({ host: '192.168.1.11:3082', origin: 'http://192.168.1.11:3082' })).toMatchObject({ status: 200 })

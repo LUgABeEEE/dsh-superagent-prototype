@@ -86,7 +86,15 @@ export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, 
   const host = req.headers.host
   if (req.headers['x-orchestrator-request'] !== '1') return false
   if (host === undefined || host === '') return false
-  if (req.headers.origin !== undefined && req.headers.origin !== `http://${host}`) return false
+  // A browser sends Origin for every cross-site call, so its host is the cross-site test: a page on
+  // this authority may call the API. The scheme is deliberately not compared — the DSH mobile gateway
+  // answers over TLS and proxies to a plain-HTTP listener, so the page's Origin is https://<host>
+  // while this server only ever sees http.
+  if (req.headers.origin !== undefined) {
+    let originHost: string
+    try { originHost = new URL(req.headers.origin).host } catch { return false }
+    if (originHost.toLowerCase() !== host.toLowerCase()) return false
+  }
   // A loopback authority is this machine, whatever port a forwarder put in front of it: an SSH
   // tunnel (`-L 3380:127.0.0.1:3080`) hands the browser `127.0.0.1:3380`, and the panel then calls
   // this API on that same authority. Nothing else can claim a loopback authority.
