@@ -89,8 +89,8 @@ export class Setup {
       throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
     }
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
-    this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
-    await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
+    this.restoreEnvironment = applyEnvironment(machine.stateDir, this.path)
+    await verifyEnvironment(resolved, context.subprocess, lifetime, this.commandEnvironment).catch((error: unknown) => {
       this.restore()
       machineProblem(error)
     })

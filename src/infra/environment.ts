@@ -109,9 +109,21 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     ...withoutShims.split('\n').map(line => '    ' + line),
     `exec ${shellQuote(name)} "$@"`,
   ].join('\n')
-  const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', github.cli === '' ? fail('gh is unavailable: this installation has no GitHub account.') : run(github.cli, 'gh'))
-  await shim('lark-cli', feishu ? run(feishu.cli, 'lark-cli') : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  // A CLI this deployment does not configure must fail for a worker, but an operator's own shell still
+  // has to reach whatever binary it normally would: a shim that only ever exits is a broken `lark-cli`
+  // for everyone else.
+  const fail = (message: string, name: string): string => [
+    'case "${DSH_SESSION_ID:-}" in',
+    '  worker-*)',
+    `    echo ${shellQuote(message)} >&2`,
+    '    exit 1',
+    '    ;;',
+    'esac',
+    ...withoutShims.split('\n').map(line => '    ' + line),
+    `exec ${shellQuote(name)} "$@"`,
+  ].join('\n')
+  await shim('gh', github.cli === '' ? fail('gh is unavailable: this installation has no GitHub account.', 'gh') : run(github.cli, 'gh'))
+  await shim('lark-cli', feishu ? run(feishu.cli, 'lark-cli') : fail('lark-cli is unavailable: this installation has no Feishu bot.', 'lark-cli'))
   // Workers must see only the deployment's git configuration; the operator's own shells must not, or
   // every commit in the panel would be authored (and pushed) as the agent account. A shim can scope
   // that to the worker Session, which a process-wide variable cannot.
@@ -121,7 +133,12 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     ...withoutShims.split('\n').map(line => '    ' + line),
     `    GIT_CONFIG_GLOBAL=${shellQuote(workerGitConfig(stateDir))}`,
     '    GIT_CONFIG_NOSYSTEM=1',
-    '    export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM',
+    '    GIT_CONFIG_COUNT=',
+    '    GIT_CONFIG_PARAMETERS=',
+    '    GIT_ASKPASS=',
+    '    GIT_TERMINAL_PROMPT=0',
+    '    unset GIT_AUTHOR_NAME GIT_COMMITTER_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL SSH_ASKPASS',
+    '    export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_ASKPASS GIT_TERMINAL_PROMPT',
     '    ;;',
     'esac',
     ...withoutShims.split('\n').map(line => '    ' + line),
@@ -160,9 +177,16 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n') + '\n')
 }
 
-/** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */
-export function applyEnvironment(variables: Record<string, string | undefined>, stateDir: string, path: string): () => void {
-  const values = { ...variables, PATH: [workerBin(stateDir), path].join(delimiter) }
+/**
+ * Prepends worker shims to `process.env.PATH`, returning a restore callback.
+ *
+ * Only PATH reaches the Host process: DSH has no way to give one Session its own environment, so the shim directory
+ * must be on the shared PATH for a worker to find it. Every other agent variable is passed explicitly to the
+ * subprocess the plugin itself runs (`commands`), so the operator's shells keep their own GH_TOKEN, git
+ * configuration and commit identity instead of silently inheriting the agent's.
+ */
+export function applyEnvironment(stateDir: string, path: string): () => void {
+  const values = { PATH: [workerBin(stateDir), path].join(delimiter) }
   const previous = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]))
   const apply = (env: Record<string, string | undefined>): void => { for (const [name, value] of Object.entries(env)) { if (value === undefined) delete process.env[name]; else process.env[name] = value } }
   apply(values)
@@ -170,7 +194,7 @@ export function applyEnvironment(variables: Record<string, string | undefined>, 
 }
 
 /** Spawns a command through the DSH subprocess runtime, which strips credential-shaped environment variables. */
-export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string>): Promise<string> {
+export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string | undefined>): Promise<string> {
   const handle = subprocess.spawn({ argv, cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
   const { exitCode } = await handle.done
   const read = (reader: SubprocessOutputReader | undefined): string => reader?.readFrom(0).text ?? ''
@@ -180,10 +204,10 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
 }
 
 /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
-export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal, env?: Record<string, string | undefined>): Promise<void> {
   const { github, stateDir } = deployment
   // `-z` separates fields with NUL and never quotes paths.
-  const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
+  const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), env).catch(() => '')).split('\0')
   if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
 }
 
@@ -191,10 +215,10 @@ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 
  * Verifies that a ticket directory's local or worktree git config defines no custom `credential.*` or `http.*extraheader`
  * keys, which the agent's git would read from the repository's own config and act on.
  */
-export async function verifyDirectory(directory: string, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+export async function verifyDirectory(directory: string, subprocess: SubprocessRuntime, signal: AbortSignal, env?: Record<string, string | undefined>): Promise<void> {
   const keys = ['git', 'config', '-z', '--show-scope', '--get-regexp', '^(credential\\..*|http\\..*extraheader)$']
   // `git config --get-regexp` exits with code 1 when no keys match.
-  const output = await runAsWorker(subprocess, keys, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  const output = await runAsWorker(subprocess, keys, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), env)
     .catch((error: unknown) => { if (error instanceof CliError && error.exitCode === 1) return ''; throw error })
   const scoped = output.split('\0')
   const local = scoped.flatMap((scope, index) => index % 2 === 0 && (scope === 'local' || scope === 'worktree') ? [scoped[index + 1]!.split('\n')[0]!] : [])

@@ -97,9 +97,11 @@ export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, 
   // An address this deployment answers on is one no other page can borrow: a DNS name that resolves
   // here is exactly what a rebinding attack needs, so names are named and IP literals are trusted.
   const literal = /^(\d{1,3}\.){3}\d{1,3}$/.test(authority) || authority.startsWith('[')
-  // Ours is the port the panel is served on; a page on another port is another deployment.
-  const samePort = host.slice(host.lastIndexOf(':') + 1) === String(port)
-  return loopback || named || (literal && samePort)
+  // An address literal is this machine wherever the panel is served from: the DSH mobile
+  // gateway answers on 192.168.1.11:3443 and proxies to this server, so the browser's Host is
+  // the gateway's, not ours. A name still has to be named — a name that resolves here is the
+  // whole of a rebinding attack.
+  return loopback || named || literal
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
@@ -258,7 +260,12 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port, runtime.machine?.allowedHosts ?? [])) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      if (!sameOrigin(req, ctx.webServer.port, runtime.machine?.allowedHosts ?? [])) {
+        // Say which authority was refused: a panel that cannot reach the API is otherwise a
+        // dead end for whoever is looking at it.
+        json(res, 403, { error: 'Same-origin management request required', host: req.headers.host ?? '' })
+        return
+      }
       try {
         await runtime.ready
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
