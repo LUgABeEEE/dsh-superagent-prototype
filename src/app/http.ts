@@ -1,7 +1,9 @@
 /** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import { appendFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { join } from 'node:path'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
@@ -84,32 +86,34 @@ function json(res: ServerResponse, status: number, value: unknown): void {
  */
 export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, allowedHosts: readonly string[] = []): boolean {
   const host = req.headers.host
-  if (req.headers['x-orchestrator-request'] !== '1') return false
   if (host === undefined || host === '') return false
-  // A browser sends Origin for every cross-site call, so its host is the cross-site test: a page on
-  // this authority may call the API. The scheme is deliberately not compared — the DSH mobile gateway
-  // answers over TLS and proxies to a plain-HTTP listener, so the page's Origin is https://<host>
-  // while this server only ever sees http.
-  if (req.headers.origin !== undefined) {
-    let originHost: string
-    try { originHost = new URL(req.headers.origin).host } catch { return false }
-    if (originHost.toLowerCase() !== host.toLowerCase()) return false
-  }
+  const authority = host.slice(0, host.lastIndexOf(':'))
   // A loopback authority is this machine, whatever port a forwarder put in front of it: an SSH
   // tunnel (`-L 3380:127.0.0.1:3080`) hands the browser `127.0.0.1:3380`, and the panel then calls
   // this API on that same authority. Nothing else can claim a loopback authority.
-  const authority0 = host.slice(0, host.lastIndexOf(':'))
-  const loopback = authority0 === '127.0.0.1' || authority0 === 'localhost' || authority0 === '[::1]'
+  const loopback = authority === '127.0.0.1' || authority === 'localhost' || authority === '[::1]'
   const named = allowedHosts.some(allowed => allowed.toLowerCase() === host.toLowerCase() || allowed === '*')
-  const authority = host.slice(0, host.lastIndexOf(':'))
   // An address this deployment answers on is one no other page can borrow: a DNS name that resolves
   // here is exactly what a rebinding attack needs, so names are named and IP literals are trusted.
   const literal = /^(\d{1,3}\.){3}\d{1,3}$/.test(authority) || authority.startsWith('[')
-  // An address literal is this machine wherever the panel is served from: the DSH mobile
-  // gateway answers on 192.168.1.11:3443 and proxies to this server, so the browser's Host is
-  // the gateway's, not ours. A name still has to be named — a name that resolves here is the
-  // whole of a rebinding attack.
-  return loopback || named || literal
+  if (!(loopback || named || literal)) return false
+  const marked = req.headers['x-orchestrator-request'] === '1'
+  const origin = req.headers.origin
+  if (origin === undefined) {
+    // No Origin at all: a same-origin fetch, a non-browser client, or a gateway in front of this
+    // server. The DSH mobile gateway answers over TLS and proxies here with `Host: 127.0.0.1:3080`,
+    // keeping neither Origin nor the panel's marker, so loopback trust carries that case. Everywhere
+    // else the marker is still required, because a name or address alone proves nothing.
+    return loopback || marked
+  }
+  // A browser sent Origin, so the page was somewhere: it must be this same authority (scheme aside —
+  // the gateway terminates TLS and this listener only ever sees http), and it must have passed the
+  // preflight that a custom header forces. A cross-site page can do neither without this server
+  // answering CORS, which it never does.
+  let originHost: string
+  try { originHost = new URL(origin).host } catch { return false }
+  if (originHost.toLowerCase() !== host.toLowerCase()) return false
+  return marked
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
@@ -270,8 +274,19 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
       if (!sameOrigin(req, ctx.webServer.port, runtime.machine?.allowedHosts ?? [])) {
         // Say which authority was refused: a panel that cannot reach the API is otherwise a
-        // dead end for whoever is looking at it.
-        json(res, 403, { error: 'Same-origin management request required', host: req.headers.host ?? '' })
+        // dead end for whoever is looking at it. Record it too — a browser cannot be asked which
+        // headers it sent, and this rejection is invisible from the operator's own machine.
+        const detail = { at: new Date().toISOString(), method: req.method, url: url.pathname,
+          host: req.headers.host ?? '', origin: req.headers.origin ?? '',
+          marked: req.headers['x-orchestrator-request'] === '1',
+          referer: req.headers.referer ?? '', agent: (req.headers['user-agent'] ?? '').slice(0, 160) }
+        try {
+          appendFileSync(join(runtime.machine.stateDir, 'same-origin-rejects.jsonl'), JSON.stringify(detail) + '\n')
+        } catch { /* Logging must never turn a refusal into a failure of its own. */ }
+        // The reason travels in the message itself: a remote page cannot show the server log, and
+        // the operator reading it is the only one who can see which authority their browser sent.
+        json(res, 403, { error: `Same-origin management request required (host=${detail.host || '∅'}, origin=${detail.origin || '∅'}, marked=${detail.marked ? 'yes' : 'no'})`,
+          host: detail.host, reason: detail })
         return
       }
       try {
